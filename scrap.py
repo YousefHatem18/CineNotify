@@ -11,7 +11,9 @@ import smtplib
 import re
 import json
 import os
+import time
 from datetime import datetime, timedelta
+
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -111,8 +113,8 @@ def save_known_dates(data_by_cinema: dict[str, set]):
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
-def get_available_dates(url: str) -> list[dict]:
-    """فتح متصفح مخصص واستخراج جميع الأيام من شريط المواعيد لرابط معين"""
+def get_available_dates(url: str, retries: int = 2) -> list[dict] | None:
+    """فتح متصفح مخصص واستخراج جميع الأيام من شريط المواعيد لرابط معين مع محاولة إعادة عند الفشل"""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -122,78 +124,93 @@ def get_available_dates(url: str) -> list[dict]:
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
-
     options.page_load_strategy = "eager"
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(25)
-    raw_days = []
 
-    try:
-        driver.get(url)
-        wait = WebDriverWait(driver, 20)
+    for attempt in range(1, retries + 1):
+        driver = None
+        raw_days = []
+        try:
+            driver = webdriver.Chrome(options=options)
+            driver.set_page_load_timeout(25)
 
-        all_days = wait.until(
-            EC.presence_of_all_elements_located(
-                (By.CSS_SELECTOR, ".viewport ol li")
+            driver.get(url)
+            wait = WebDriverWait(driver, 20)
+
+            all_days = wait.until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, ".viewport ol li")
+                )
             )
-        )
-        print(f"إجمالي عدد الأيام في شريط الصفحة: {len(all_days)}")
+            print(f"إجمالي عدد الأيام في شريط الصفحة: {len(all_days)}")
 
-        for day_li in all_days:
-            # استخدام textContent لقراءة النص حتى لو كان العنصر خارج حدود الشاشة المرئية
-            raw_text = day_li.get_attribute("textContent").strip()
-            # إزالة المسافات الزائدة والأسطر
-            label = " ".join(raw_text.split())
+            for day_li in all_days:
+                # استخدام textContent لقراءة النص حتى لو كان العنصر خارج حدود الشاشة المرئية
+                raw_text = day_li.get_attribute("textContent").strip()
+                # إزالة المسافات الزائدة والأسطر
+                label = " ".join(raw_text.split())
 
-            link = day_li.find_elements(By.TAG_NAME, "a")
-            span = day_li.find_elements(By.TAG_NAME, "span")
+                link = day_li.find_elements(By.TAG_NAME, "a")
+                span = day_li.find_elements(By.TAG_NAME, "span")
 
-            date_code = None
-            href = None
+                date_code = None
+                href = None
 
-            if link:
-                href = link[0].get_attribute("href")
-                match = re.search(r"[?&]d=(\d{8})", href or "")
-                if match:
-                    date_code = match.group(1)
-            elif span:
-                href = driver.current_url
+                if link:
+                    href = link[0].get_attribute("href")
+                    match = re.search(r"[?&]d=(\d{8})", href or "")
+                    if match:
+                        date_code = match.group(1)
+                elif span:
+                    href = driver.current_url
 
-            raw_days.append({
-                "label": label,
-                "date": date_code,
-                "url": href,
-                "is_span": bool(span),
-            })
+                raw_days.append({
+                    "label": label,
+                    "date": date_code,
+                    "url": href,
+                    "is_span": bool(span),
+                })
 
-        # حل كود التاريخ لليوم المحدد الحالي (span) بدقة
-        for i, item in enumerate(raw_days):
-            if not item["date"]:
-                # 1. فحص ما إذا كان الرابط الحالي يحتوي على ?d=YYYYMMDD
-                current_match = re.search(r"[?&]d=(\d{8})", driver.current_url)
-                if current_match:
-                    item["date"] = current_match.group(1)
-                else:
-                    # 2. حساب التاريخ بالنسبة للأيام المجاورة
-                    if i + 1 < len(raw_days) and raw_days[i + 1]["date"]:
-                        next_dt = datetime.strptime(raw_days[i + 1]["date"], "%Y%m%d")
-                        item["date"] = (next_dt - timedelta(days=1)).strftime("%Y%m%d")
-                    elif i > 0 and raw_days[i - 1]["date"]:
-                        prev_dt = datetime.strptime(raw_days[i - 1]["date"], "%Y%m%d")
-                        item["date"] = (prev_dt + timedelta(days=1)).strftime("%Y%m%d")
+            # حل كود التاريخ لليوم المحدد الحالي (span) بدقة
+            for i, item in enumerate(raw_days):
+                if not item["date"]:
+                    # 1. فحص ما إذا كان الرابط الحالي يحتوي على ?d=YYYYMMDD
+                    current_match = re.search(r"[?&]d=(\d{8})", driver.current_url)
+                    if current_match:
+                        item["date"] = current_match.group(1)
+                    else:
+                        # 2. حساب التاريخ بالنسبة للأيام المجاورة
+                        if i + 1 < len(raw_days) and raw_days[i + 1]["date"]:
+                            next_dt = datetime.strptime(raw_days[i + 1]["date"], "%Y%m%d")
+                            item["date"] = (next_dt - timedelta(days=1)).strftime("%Y%m%d")
+                        elif i > 0 and raw_days[i - 1]["date"]:
+                            prev_dt = datetime.strptime(raw_days[i - 1]["date"], "%Y%m%d")
+                            item["date"] = (prev_dt + timedelta(days=1)).strftime("%Y%m%d")
 
-    except Exception as e:
-        print(f"⚠️ خطأ أثناء جلب المواعيد من {url}: {e}")
+            # تنظيف وإرجاع النتائج النهائية
+            results = [
+                {"label": d["label"], "date": d["date"], "url": d["url"]}
+                for d in raw_days if d["label"] and d["date"]
+            ]
 
-    finally:
-        driver.quit()
+            if results:
+                return results
+            else:
+                print(f"⚠️ محاولة {attempt}/{retries}: تم تحميل الصفحة ولكن لم يتم استخراج أي مواعيد صالحة.")
 
-    # تنظيف وإرجاع النتائج النهائية
-    results = [
-        {"label": d["label"], "date": d["date"], "url": d["url"]}
-        for d in raw_days if d["label"]
-    ]
-    return results
+        except Exception as e:
+            print(f"⚠️ محاولة {attempt}/{retries} فشلت أثناء جلب المواعيد من {url}: {e}")
+
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+        if attempt < retries:
+            time.sleep(3)
+
+    return None
 
 
 if __name__ == "__main__":
@@ -212,6 +229,10 @@ if __name__ == "__main__":
         print(f"==========================================")
 
         available = get_available_dates(c_url)
+        if not available:
+            print(f"⚠️ فشل جلب المواعيد لـ {c_name} (خطأ في التحميل أو الصفحة فارغة). تم تخطي التحديث والاحتفاظ بالتواريخ السابقة.")
+            continue
+
         for d in available:
             print(f" - {d['label']}  ({d['date']})")
 
