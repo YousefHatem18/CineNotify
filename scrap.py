@@ -8,6 +8,7 @@ if sys.platform == "win32":
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import smtplib
+import ssl
 import re
 import json
 import os
@@ -51,10 +52,17 @@ CINEMAS = [
 # ملف حفظ التواريخ المرصودة لكل سينما لتجنب التكرار
 KNOWN_DATES_FILE = "known_dates.json"
 
+def _clean_env(name: str) -> str:
+    """Read an env var, ignoring quotes, surrounding whitespace, and case."""
+    raw = os.environ.get(name) or os.environ.get(name.lower()) or ""
+    return raw.strip().strip('"').strip("'")
+
+
 # إعدادات البريد من متغيرات البيئة
-sender_email = os.environ.get("SENDER_EMAIL", "")
-app_password = os.environ.get("APP_PASSWORD", "")
-receiver_email = os.environ.get("RECEIVER_EMAIL", "")
+# Gmail app passwords are 16 letters; spaces and quotes are ignored.
+sender_email = _clean_env("SENDER_EMAIL")
+app_password = _clean_env("APP_PASSWORD").replace(" ", "")
+receiver_email = _clean_env("RECEIVER_EMAIL")
 
 
 def sendEmail(new_days_by_cinema: dict[str, list[dict]]):
@@ -82,12 +90,43 @@ def sendEmail(new_days_by_cinema: dict[str, list[dict]]):
 
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(sender_email, app_password)
-        server.send_message(msg)
+    context = ssl.create_default_context()
+    errors = []
 
-    print("✅ Email Sent")
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30, context=context) as server:
+            server.login(sender_email, app_password)
+            server.send_message(msg)
+        print("✅ Email Sent")
+        return
+    except Exception as exc:
+        errors.append(f"port 465: {type(exc).__name__}: {exc}")
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(sender_email, app_password)
+            server.send_message(msg)
+        print("✅ Email Sent")
+        return
+    except Exception as exc:
+        errors.append(f"port 587: {type(exc).__name__}: {exc}")
+
+    print("SMTP login failed.")
+    for line in errors:
+        print(line)
+    print(
+        f"Signing in as {sender_email} with an app password of {len(app_password)} characters "
+        "(Gmail app passwords are 16 letters, no spaces or quotes)."
+    )
+    print(
+        "On GitHub, set repository secrets SENDER_EMAIL, APP_PASSWORD, and RECEIVER_EMAIL "
+        "to the raw values only. If the length is already 16 and Gmail still closes the "
+        "connection, Google is blocking the Actions runner — run this script on your VPS."
+    )
+    raise RuntimeError("Gmail rejected the SMTP login")
 
 
 def load_known_dates() -> dict[str, set]:
